@@ -249,51 +249,69 @@ Scheduling *StatefulSetSchedulingConfiguration `json:"scheduling,omitempty"`
 
 ```go
 type StatefulSetSchedulingConfiguration struct {
-    // SchedulingPolicy selects gang or basic scheduling. For Parallel
-    // StatefulSets the user sets gang: {}; for OrderedReady, only basic: {}
-    // is valid. For Alpha, the controller derives minCount from spec.replicas
-    // and a user-supplied minCount is rejected at admission. User-configurable
-    // minCount is planned for Beta.
+    // SchedulingPolicy defines the scheduling policy for this StatefulSet.
+    // Exactly one of Basic or Gang must be set.
+    // For Parallel StatefulSets the user sets gang: {}; for OrderedReady,
+    // only basic: {} is valid. For Alpha, the controller derives minCount
+    // from spec.replicas and a user-supplied minCount is rejected at
+    // admission. User-configurable minCount is planned for Beta.
+    // This field is immutable after creation: the policy may not be added or
+    // removed. The policy variant (basic/gang) is frozen by hand-written
+    // validation; only schedulingPolicy.gang.minCount may be changed.
+    //
     // +optional
     // +k8s:optional
     // +k8s:update=NoSet
     // +k8s:update=NoUnset
-    SchedulingPolicy *WorkloadPodGroupSchedulingPolicy
+    SchedulingPolicy *schedulingv1alpha3.WorkloadPodGroupSchedulingPolicy `json:"schedulingPolicy,omitempty" protobuf:"bytes,1,opt,name=schedulingPolicy"`
 
-    // SchedulingConstraints carries topology placement rules (e.g., zone
-    // co-location). Only meaningful with gang policy — basic-policy
-    // StatefulSets ignore topology constraints at the scheduler level.
+    // SchedulingConstraints defines scheduling constraints (e.g. topology)
+    // for the StatefulSet's pods.
+    // This field is immutable after creation.
+    //
     // +optional
     // +k8s:optional
     // +k8s:immutable
-    SchedulingConstraints *WorkloadPodGroupSchedulingConstraints
+    SchedulingConstraints *schedulingv1alpha3.WorkloadPodGroupSchedulingConstraints `json:"schedulingConstraints,omitempty" protobuf:"bytes,2,opt,name=schedulingConstraints"`
 
-    // DisruptionMode controls whether preemption evicts a single pod or
-    // the entire gang. Stateful workloads that cannot tolerate partial
-    // membership (e.g., quorum-based systems) should use "all".
+    // DisruptionMode defines the mode in which the StatefulSet's pods can be
+    // disrupted. One of Single, All.
+    // Only meaningful with Gang policy — for Basic policy this field is a
+    // no-op (pods are always disrupted independently).
+    // This field is immutable after creation: it may not be added or removed,
+    // and the selected mode may not be changed.
+    //
     // +optional
     // +k8s:optional
     // +k8s:immutable
-    DisruptionMode *WorkloadPodGroupDisruptionMode
+    DisruptionMode *schedulingv1alpha3.WorkloadPodGroupDisruptionMode `json:"disruptionMode,omitempty" protobuf:"bytes,3,opt,name=disruptionMode"`
 
-    // ResourceClaims defines ResourceClaims or ResourceClaimTemplates that
-    // are shared across all pods in the StatefulSet's PodGroup. Each entry
-    // maps to a PodGroupResourceClaim in the PodGroupTemplate and PodGroup.
-    // Pods consume these shared claims by defining a matching entry in their
-    // own spec.resourceClaims (same name and same ResourceClaimName or
-    // ResourceClaimTemplateName). The ResourceClaim controller creates one
-    // ResourceClaim per PodGroup for each ResourceClaimTemplate reference,
-    // and the claim is reserved for the PodGroup rather than individual pods.
+    // ResourceClaims defines which ResourceClaims may be shared among Pods in
+    // the StatefulSet. Pods consume the devices allocated to a PodGroup's
+    // claim by defining a claim in its own Spec.ResourceClaims that matches
+    // the PodGroup's claim exactly. The claim must have the same name and
+    // refer to the same ResourceClaim or ResourceClaimTemplate.
+    // At most 4 claims may be set, matching the limit on the resulting
+    // PodGroup.
+    // This list is immutable after creation: entries may neither be added,
+    // removed, nor modified.
     //
     // This field requires the DRAWorkloadResourceClaims feature gate
     // (KEP-5729) to be enabled in kube-apiserver, kube-controller-manager,
     // kube-scheduler, and kubelet.
     //
     // +optional
+    // +patchMergeKey=name
+    // +patchStrategy=merge
+    // +listType=map
+    // +listMapKey=name
     // +k8s:optional
+    // +k8s:listType=map
+    // +k8s:listMapKey=name
+    // +k8s:maxItems=4
     // +k8s:immutable
     // +featureGate=DRAWorkloadResourceClaims
-    ResourceClaims []PodGroupResourceClaim
+    ResourceClaims []schedulingv1alpha3.WorkloadPodGroupResourceClaim `json:"resourceClaims,omitempty" patchStrategy:"merge" patchMergeKey:"name" protobuf:"bytes,4,rep,name=resourceClaims"`
 }
 ```
 
@@ -474,8 +492,7 @@ reserved for the PodGroup (not per-pod), and all pods are placed within the same
 
 3. **Mutable minCount on PodGroup**: Per KEP-5832, `minCount` on the standalone `PodGroup` object
    is mutable. This means simple scaling operations (changing `spec.replicas`) can be handled by
-   updating the PodGroup's `minCount` in place, without the full drain-and-recreate pattern
-   described in the original design document. However, operations that change the PodGroup
+   updating the PodGroup's `minCount` in place. However, operations that change the PodGroup
    structure (e.g., partition changes creating new PodGroups) still require PodGroup recreation.
 
 4. **schedulingGroup immutability on pods**: The `spec.schedulingGroup.podGroupName` field on pods
@@ -507,6 +524,15 @@ reserved for the PodGroup (not per-pod), and all pods are placed within the same
 8. **Maximum 4 ResourceClaims per PodGroup**: KEP-5729 limits the `resourceClaims` list to 4
    entries per PodGroupTemplate/PodGroup. This limit applies to the StatefulSet's
    `spec.scheduling.resourceClaims` field as well.
+
+9. **Higher-level controllers composing StatefulSets**: Controllers such as LeaderWorkerSet (LWS)
+   create and manage StatefulSets as their building blocks. The StatefulSet controller only
+   creates Workload and PodGroup objects when `spec.scheduling` is explicitly set — there is no
+   heuristic or automatic opt-in. This means StatefulSets created by higher-level controllers
+   will not produce scheduling objects unless the composing controller explicitly sets
+   `spec.scheduling` on the inner StatefulSet specs. Higher-level controllers that manage their
+   own gang scheduling across multiple StatefulSets should not set `spec.scheduling` on the
+   composed StatefulSets to avoid conflicting or redundant PodGroups.
 
 ### Risks and Mitigations
 
@@ -556,6 +582,11 @@ Gang scheduling for StatefulSet **requires** `podManagementPolicy: Parallel`. Th
 policy creates pods sequentially, waiting for each to become Ready before creating the next, which
 fundamentally conflicts with gang scheduling's requirement that all pods exist simultaneously for
 the scheduler to evaluate them as a group.
+
+**DisruptionMode with Basic policy**: `DisruptionMode` is only meaningful with Gang policy, where
+it controls whether preemption evicts a single pod or the entire gang. For OrderedReady
+StatefulSets with Basic policy, `DisruptionMode` is a no-op — pods are always disrupted
+independently regardless of the value set, since there is no gang to atomically disrupt.
 
 Admission validation enforces this constraint:
 - If `spec.scheduling.schedulingPolicy.gang` is non-nil and `podManagementPolicy` is
@@ -804,7 +835,7 @@ StatefulSet Created (podManagementPolicy: Parallel, scheduling.policy.gang)
 #### Scale Lifecycle
 
 Per KEP-5832, `minCount` on the standalone `PodGroup` object is mutable, which significantly
-simplifies scaling compared to the original design document's drain-and-recreate approach.
+simplifies scaling.
 
 **Scale Up** (e.g., replicas 3 → 5):
 1. The controller updates the PodGroup's `schedulingPolicy.gang.minCount` from 3 to 5.
@@ -818,8 +849,8 @@ simplifies scaling compared to the original design document's drain-and-recreate
 1. Delete pods with ordinals ≥ 3.
 2. Update the PodGroup's `schedulingPolicy.gang.minCount` from 5 to 3.
 
-This non-disruptive scaling is a significant improvement over the drain-and-recreate pattern
-described in the original design document, enabled by the PodGroup decoupling in KEP-5832.
+This non-disruptive scaling is enabled by the mutable `minCount` on the standalone PodGroup
+(KEP-5832).
 
 **Note on Alpha behavior**: The examples above reflect Alpha, where `minCount` is always derived
 from `spec.replicas` — scaling replicas automatically updates `minCount` to match. In Beta, when

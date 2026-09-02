@@ -11,8 +11,10 @@ reviewers:
   - "@kannon92"
   - "@helayoty"
   - "@soltysh"
+  - "@janetkuo"
 approvers:
   - "@soltysh"
+  - "@janetkuo"
 see-also:
   - "/keps/sig-apps/5547-integrate-workload-with-job"
   - "/keps/sig-scheduling/4671-gang-scheduling"
